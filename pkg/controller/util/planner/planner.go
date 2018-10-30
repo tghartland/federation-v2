@@ -20,6 +20,7 @@ import (
 	"hash/fnv"
 	"sort"
 
+	"github.com/golang/glog"
 	fedschedulingv1a1 "github.com/kubernetes-sigs/federation-v2/pkg/apis/scheduling/v1alpha1"
 )
 
@@ -100,15 +101,22 @@ func (p *Planner) Plan(availableClusters []string, currentReplicaCount map[strin
 	// This is the requested total replicas in preferences
 	remainingReplicas := int64(p.preferences.Spec.TotalReplicas)
 
+	glog.Infof("About to place %d replicas", remainingReplicas)
+
 	// Assign each cluster the minimum number of replicas it requested.
 	for _, preference := range preferences {
 		min := minInt64(preference.MinReplicas, remainingReplicas)
+		glog.Infof("Want to assign minimum %d to %s", min, preference.clusterName)
 		if capacity, hasCapacity := estimatedCapacity[preference.clusterName]; hasCapacity {
 			min = minInt64(min, capacity)
+			glog.Infof("Assigning %d to %s as its capicity is %d", min, preference.clusterName, capacity)
 		}
 		remainingReplicas -= min
+		glog.Infof("Removed %d replicas from pool, %d left", min, remainingReplicas)
 		plan[preference.clusterName] = min
 	}
+
+	glog.Infof("Placed minimum replicas in each cluster. %d left to assign", remainingReplicas)
 
 	// This map contains information how many replicas were assigned to
 	// the cluster based only on the current replica count and
@@ -117,24 +125,33 @@ func (p *Planner) Plan(availableClusters []string, currentReplicaCount map[strin
 	preallocated := make(map[string]int64)
 
 	if p.preferences.Spec.Rebalance == false {
+		glog.Info("About to assign remaining replicas (for rebalance == false)")
 		for _, preference := range preferences {
 			planned := plan[preference.clusterName]
 			count, hasSome := currentReplicaCount[preference.clusterName]
+			glog.Infof("Now trying to assign to %s. It already has %d replicas", preference.clusterName, count)
 			if hasSome && count > planned {
+				glog.Info("It already has more replicas than we have planned to assign to it")
 				target := count
 				if preference.MaxReplicas != nil {
 					target = minInt64(*preference.MaxReplicas, target)
+					glog.Infof("Cluster has MaxReplicas %d, will only try to assign %d", preference.MaxReplicas, target)
 				}
 				if capacity, hasCapacity := estimatedCapacity[preference.clusterName]; hasCapacity {
 					target = minInt64(capacity, target)
+					glog.Infof("Cluster has capacity %d, will only try to assign %d", capacity, target)
 				}
+				glog.Infof("Target %d, planned %d, remainingReplicas %d", target, planned, remainingReplicas)
 				extra := minInt64(target-planned, remainingReplicas)
 				if extra < 0 {
 					extra = 0
 				}
+				glog.Infof("Assigned %d more replicas to %s in this stage", target-planned, preference.clusterName)
+
 				remainingReplicas -= extra
 				preallocated[preference.clusterName] = extra
 				plan[preference.clusterName] = extra + planned
+				glog.Infof("%d replicas remaining, for %s will assign %d = %d", remainingReplicas, preference.clusterName, target, extra+planned)
 			}
 		}
 	}
@@ -153,22 +170,29 @@ func (p *Planner) Plan(availableClusters []string, currentReplicaCount map[strin
 	// TODO: This algorithm is O(clusterCount^2 * log(replicas)) which is good for up to 100 clusters.
 	// Find something faster.
 	for trial := 0; modified && remainingReplicas > 0; trial++ {
+		glog.Infof("Starting distribution trial %d", trial)
 
 		modified = false
 		weightSum := int64(0)
 		for _, preference := range preferences {
 			weightSum += preference.Weight
 		}
+		glog.Infof("Weight sum is %d", weightSum)
 		newPreferences := make([]*namedClusterPreferences, 0, len(preferences))
 
 		distributeInThisLoop := remainingReplicas
 
+		glog.Infof("Distributing %d remaining replicas in this trial loop", distributeInThisLoop)
+
 		for _, preference := range preferences {
 			if weightSum > 0 {
 				start := plan[preference.clusterName]
+				glog.Infof("Trying to distribute to %s, was already planning to give %d replicas", preference.clusterName, start)
 				// Distribute the remaining replicas, rounding fractions always up.
 				extra := (distributeInThisLoop*preference.Weight + weightSum - 1) / weightSum
+				glog.Infof("Want to distribute %d more replicas to %s", extra, preference.clusterName)
 				extra = minInt64(extra, remainingReplicas)
+				glog.Infof("Because of remainingReplicas (%d), can distribute %d to %s", remainingReplicas, extra, preference.clusterName)
 
 				// Account preallocated.
 				prealloc := preallocated[preference.clusterName]
@@ -200,6 +224,7 @@ func (p *Planner) Plan(availableClusters []string, currentReplicaCount map[strin
 					newPreferences = append(newPreferences, preference)
 				}
 
+				glog.Infof("Allocated %d more replicas to %s", (total - start), preference.clusterName)
 				// Only total-start replicas were actually taken.
 				remainingReplicas -= (total - start)
 				plan[preference.clusterName] = total
@@ -214,6 +239,8 @@ func (p *Planner) Plan(availableClusters []string, currentReplicaCount map[strin
 		}
 		preferences = newPreferences
 	}
+
+	glog.Info("Finished placing replicas")
 
 	if p.preferences.Spec.Rebalance {
 		return plan, overflow
